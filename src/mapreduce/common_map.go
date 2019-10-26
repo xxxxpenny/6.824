@@ -60,7 +60,7 @@ func doMap(
 
 	input, err := os.Open(inFile)
 	if err != nil {
-		log.Fatal("oprn file: ", err)
+		log.Fatal("open file: ", err)
 	}
 	defer input.Close()
 
