@@ -17,29 +17,22 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
 
+const ElectionTimeout time.Duration = time.Duration(1000 * time.Millisecond)
+const AppendEntriesInterval time.Duration = time.Duration(100 * time.Millisecond)
 
-
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
+func randDuration(min time.Duration) time.Duration {
+	extra := time.Duration(rand.Int63()) % min
+	return time.Duration(min + extra)
 }
 
 //
@@ -54,6 +47,24 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
+
+	commitIndex int
+	lastApplied int
+
+	nextIndex  []int
+	matchIndex []int
+
+	state         ServerState
+	applyCh       chan ApplyMsg
+	shutdownCh    chan struct{}
+	notifyApplyCh chan struct{}
+	electionTimer *time.Timer
+}
+
+func (rf *Raft) campaign() {
 
 }
 
@@ -61,12 +72,9 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return rf.currentTerm, rf.state == Leader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +91,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,30 +114,14 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-}
-
-//
-// example RequestVote RPC handler.
-//
+// RPC for RequestVote
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+}
+
+// RPC for AppendEntries
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
 }
 
 //
@@ -167,6 +158,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendRetries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -188,7 +183,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -222,10 +216,36 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
 
+	rf.log = []LogEntry{{0, 0, nil}}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.nextIndex = make([]int, len(peers)-1)
+	rf.matchIndex = make([]int, len(peers)-1)
+
+	rf.state = Follower
+	rf.applyCh = applyCh
+	rf.notifyApplyCh = make(chan struct{}, 100)
+	rf.shutdownCh = make(chan struct{})
+	rf.electionTimer = time.NewTimer(randDuration(ElectionTimeout))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+
+
+	go func() {
+		for {
+			select {
+			case <-rf.electionTimer.C:
+				rf.campaign()
+			case <-rf.shutdownCh:
+				return
+			}
+		}
+	}()
 
 	return rf
 }
