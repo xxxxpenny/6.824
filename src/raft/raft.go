@@ -35,6 +35,11 @@ func randDuration(min time.Duration) time.Duration {
 	return time.Duration(min + extra)
 }
 
+func resetTimer(timer *time.Timer, duration time.Duration) {
+	timer.Stop()
+	timer.Reset(duration)
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -50,6 +55,7 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
+	logIndex    int // next log index
 
 	commitIndex int
 	lastApplied int
@@ -66,6 +72,121 @@ type Raft struct {
 
 func (rf *Raft) campaign() {
 
+	// step 1.
+	// increment term, transitions to candidate, vote itself, reset timer
+	rf.mu.Lock()
+	if rf.state == Leader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.currentTerm++
+	rf.state = Candidate
+	rf.votedFor = rf.me
+	lastLog := rf.log[len(rf.log)-1]
+	requestVoteArgs := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+		LastLogIndex: lastLog.LogIndex,
+		LastLogTerm:  lastLog.LogTerm,
+	}
+	electionDuration := randDuration(ElectionTimeout)
+	timeout := time.After(electionDuration)
+	resetTimer(rf.electionTimer, electionDuration)
+	rf.mu.Unlock()
+
+	// step 2.
+	// issues RequestVote RPCs in parallel to each of the other servers
+	requestReplyCh := make(chan *RequestVoteReply)
+	for i := range rf.peers {
+		if i != rf.me {
+			go func() {
+				requestVoteReply := &RequestVoteReply{}
+				rf.sendRequestVote(i, requestVoteArgs, requestVoteReply)
+				requestReplyCh <- requestVoteReply
+			}()
+		}
+	}
+
+	count, threshold := 1, len(rf.peers)/2
+	for count < threshold {
+		select {
+		case <-rf.shutdownCh:
+			return
+		case <-timeout:
+			return
+		case reply := <-requestReplyCh:
+			if reply.VoteGranted {
+				count++
+			} else {
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					// If RPC request or response contains term T > currentTerm
+					// set currentTerm = T, convert to follower
+					rf.stepDown(reply.Term)
+				}
+				rf.mu.Unlock()
+			}
+		}
+	}
+
+	rf.mu.Lock()
+	if rf.state == Candidate {
+		rf.state = Leader
+		rf.initIndex()
+		go rf.notifyNewLeader()
+		go rf.heartbeat()
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) stepDown(term int) {
+	rf.currentTerm = term
+	rf.state = Follower
+	rf.votedFor = -1
+	resetTimer(rf.electionTimer, randDuration(ElectionTimeout))
+}
+
+func (rf *Raft) sendLogEntry(server int) {
+
+}
+
+func (rf *Raft) heartbeat() {
+	timer := time.NewTimer(AppendEntriesInterval)
+	for {
+		select {
+		case <-rf.shutdownCh:
+			return
+		case <-timer.C:
+			if _, leader := rf.GetState(); !leader {
+				// so it's not leader, stop heartbeat
+				return
+			}
+			go rf.replicate()
+			timer.Reset(AppendEntriesInterval)
+		}
+	}
+}
+
+func (rf *Raft) notifyNewLeader() {
+
+}
+
+func (rf *Raft) replicate() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go rf.sendLogEntry(i)
+		}
+	}
+}
+
+func (rf *Raft) initIndex() {
+	l := len(rf.peers)
+	rf.nextIndex, rf.matchIndex = make([]int, l), make([]int, l)
+	for i := 0; i < l; i++ {
+		rf.nextIndex[i] = rf.logIndex
+		rf.matchIndex[i] = 0
+	}
+
 }
 
 // return currentTerm and whether this server
@@ -73,6 +194,8 @@ func (rf *Raft) campaign() {
 func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.state == Leader
 }
 
@@ -112,16 +235,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-}
-
-// RPC for RequestVote
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-// RPC for AppendEntries
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
 }
 
 //
@@ -220,6 +333,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 
 	rf.log = []LogEntry{{0, 0, nil}}
+	rf.logIndex = 1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
@@ -233,8 +347,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer = time.NewTimer(randDuration(ElectionTimeout))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-
 
 	go func() {
 		for {
