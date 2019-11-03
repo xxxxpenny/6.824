@@ -3,60 +3,132 @@ package raft
 // RPC for RequestVote
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.send(args, reply)
+}
 
-	if args.Term == rf.currentTerm && args.CandidateID == rf.votedFor {
-		reply.VoteGranted, reply.Term = true, rf.currentTerm
-		return
+// RPC for AppendEntries
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.send(args, reply)
+}
+
+func (rf *Raft) send(args interface{}, reply interface{}) {
+	e := &ev{
+		target:      args,
+		returnValue: reply,
+		err:          make(chan error),
 	}
 
-	if args.Term < rf.currentTerm ||
-		(args.Term == rf.currentTerm && args.CandidateID != rf.votedFor) {
-		reply.VoteGranted, reply.Term = false, rf.currentTerm
-		return
+	rf.c <- e
+
+	select {
+	case <-e.ok:
+		DPrintf("RPC finish")
+	}
+}
+
+func (rf *Raft) processRequestVote(args *RequestVoteArgs) (*RequestVoteReply, bool) {
+
+	if args.Term < rf.currentTerm {
+		return &RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: false,
+		}, false
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm, rf.votedFor = args.Term, -1
-		if rf.state != Follower {
-			resetTimer(rf.electionTimer, randDuration(ElectionTimeout))
-			rf.state = Follower
+		if rf.state == Leader {
+			// todo stop heartbeat
 		}
+		rf.state = Follower
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.leaderId = -1
+	} else if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
+		return &RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: false,
+		}, false
 	}
 
-	reply.Term = args.Term
 	lastLogIndex := rf.logIndex - 1
 	lastLogTerm := rf.log[lastLogIndex].LogTerm
 
 	if lastLogTerm > args.Term ||
 		(lastLogTerm == args.Term && lastLogIndex > args.LastLogIndex) {
-		reply.VoteGranted = false
-		return
+		return &RequestVoteReply{
+			Term:        rf.currentTerm,
+			VoteGranted: false,
+		}, false
 	}
 
 	rf.votedFor = args.CandidateID
-	reply.VoteGranted = true
-	resetTimer(rf.electionTimer, randDuration(ElectionTimeout))
 
+	return &RequestVoteReply{
+		Term:        rf.currentTerm,
+		VoteGranted: true,
+	}, true
 }
 
-// RPC for AppendEntries
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) processAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
 
 	if args.Term < rf.currentTerm {
-		reply.Term, reply.Success = rf.currentTerm, false
-		return
+		return &AppendEntriesReply{
+			Term:          rf.currentTerm,
+			Success:       false,
+		}, false
 	}
 
-	reply.Term = args.Term
-	resetTimer(rf.electionTimer, randDuration(ElectionTimeout))
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm, rf.votedFor = args.Term, -1
+	if args.Term == rf.currentTerm {
+		if rf.state == Candidate {
+			rf.state = Follower
+		}
+		rf.leaderId = args.LeaderID
+	} else {
+		if rf.state == Leader {
+			// todo stop heartbeat
+		}
+		rf.state = Follower
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.leaderId = args.LeaderID
 	}
 
+	logIndex := rf.logIndex
+	prevLogIndex, prevLogTerm := args.PrevLogIndex, args.PrevLogTerm
+	if logIndex <= prevLogIndex || rf.log[prevLogIndex].LogTerm != prevLogTerm {
+		return &AppendEntriesReply{
+			Term:          rf.currentTerm,
+			Success:       false,
+		}, false
+	}
+
+	i := 0
+	for ; i < len(args.Entries); i++ {
+
+		if prevLogIndex+1+i >= logIndex {
+			break
+		}
+		if rf.log[prevLogIndex+1+i].LogTerm != args.Entries[i].LogTerm {
+			rf.logIndex = prevLogIndex + 1 + i
+			rf.log = append(rf.log[:rf.logIndex])
+		}
+	}
+
+	for ; i < len(args.Entries); i++ {
+		rf.log = append(rf.log, args.Entries[i])
+		rf.logIndex++
+	}
+
+	oldCommitIndex := rf.commitIndex
+	rf.commitIndex = Max(rf.commitIndex, Min(args.LeaderCommit, prevLogIndex+len(args.Entries)))
+
+	if rf.commitIndex > oldCommitIndex {
+		rf.notifyApplyCh <- struct{}{}
+	}
+
+	return &AppendEntriesReply{
+		Term:          rf.currentTerm,
+		Success:       true,
+	}, true
 
 }

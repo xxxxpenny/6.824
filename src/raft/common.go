@@ -51,7 +51,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term          int
 	Success       bool
-	ConflictIndex int
 }
 
 type LogEntry struct {
@@ -66,6 +65,7 @@ const (
 	Leader ServerState = iota
 	Follower
 	Candidate
+	Stopped
 )
 
 func (state ServerState) String() string {
@@ -76,5 +76,15 @@ func (state ServerState) String() string {
 		return "Follower"
 	case Candidate:
 		return "Candidate"
+	case Stopped:
+		return "Stopped"
 	}
+
+	return ""
+}
+
+type ev struct {
+	target interface{}
+	returnValue interface{}
+	err chan error
 }

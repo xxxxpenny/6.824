@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"errors"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -40,6 +41,14 @@ func resetTimer(timer *time.Timer, duration time.Duration) {
 	timer.Reset(duration)
 }
 
+func afterBetween(min time.Duration, max time.Duration) <-chan time.Time {
+	d, delta := min, max-min
+	if delta > 0 {
+		d = d + time.Duration(rand.Int63())%min
+	}
+	return time.After(d)
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -54,6 +63,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
+	leaderId    int
 	log         []LogEntry
 	logIndex    int // next log index
 
@@ -67,7 +77,141 @@ type Raft struct {
 	applyCh       chan ApplyMsg
 	shutdownCh    chan struct{}
 	notifyApplyCh chan struct{}
+
+	c chan *ev
+
 	electionTimer *time.Timer
+}
+
+func (rf *Raft) serverState() ServerState {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state
+}
+
+func (rf *Raft) loop() {
+	state := rf.serverState()
+	for state != Stopped {
+		switch state {
+		case Follower:
+			rf.followerLoop()
+		case Candidate:
+			rf.candidateLoop()
+		case Leader:
+			rf.leaderLoop()
+		}
+		state = rf.serverState()
+	}
+}
+
+func (rf *Raft) followerLoop() {
+	timeoutChan := afterBetween(ElectionTimeout, 2*ElectionTimeout)
+	for rf.serverState() == Follower {
+		update := false
+		var err error
+		select {
+		case <-rf.shutdownCh:
+			rf.state = Stopped
+		case e := <-rf.c:
+
+			switch req := e.target.(type) {
+			case *RequestVoteArgs:
+				e.returnValue, update = rf.processRequestVote(req)
+			case *AppendEntriesArgs:
+				e.returnValue, update = rf.processAppendEntries(req)
+			default:
+				err = errors.New("No Supported Request")
+			}
+			e.err <- err
+		case <-timeoutChan:
+			rf.state = Candidate
+		}
+
+		if update {
+			timeoutChan = afterBetween(ElectionTimeout, 2*ElectionTimeout)
+		}
+	}
+}
+
+func (rf *Raft) candidateLoop() {
+
+	var replyCh chan *RequestVoteReply
+	var timeoutCh <-chan time.Time
+	var err error
+	lastLog := rf.log[rf.logIndex-1]
+	doVote := true
+	count := 0
+
+	for rf.serverState() == Candidate {
+		if doVote {
+
+			rf.currentTerm++
+			rf.votedFor = rf.me
+
+			replyCh = make(chan *RequestVoteReply)
+			args := &RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateID:  rf.me,
+				LastLogIndex: lastLog.LogIndex,
+				LastLogTerm:  lastLog.LogTerm,
+			}
+
+			for i := range rf.peers {
+				if i != rf.me {
+					go func() {
+						requestVoteReply := &RequestVoteReply{}
+						rf.sendRequestVote(i, args, requestVoteReply)
+						replyCh <- requestVoteReply
+					}()
+				}
+			}
+			timeoutCh = afterBetween(ElectionTimeout, ElectionTimeout*2)
+			doVote = false
+			count = 1
+		}
+
+		if count >= len(rf.peers)/2+1 {
+			rf.state = Leader
+		}
+
+		select {
+		case <-rf.shutdownCh:
+			rf.state = Stopped
+		case reply := <-replyCh:
+			if reply.VoteGranted {
+				count++
+			} else {
+				if reply.Term > rf.currentTerm {
+					if rf.state == Leader {
+						// todo stop heartbeat
+					}
+					rf.state = Follower
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+					rf.leaderId = -1
+				}
+			}
+
+		case e := <-rf.c:
+			switch req := e.target.(type) {
+			case *RequestVoteArgs:
+				e.target, _ = rf.processRequestVote(req)
+			case *AppendEntriesArgs:
+				e.target, _ = rf.processAppendEntries(req)
+			default:
+				err = errors.New("No Supported Request")
+			}
+
+			e.err <- err
+		case <-timeoutCh:
+			doVote = true
+		}
+	}
+
+}
+
+func (rf *Raft) leaderLoop() {
+
 }
 
 func (rf *Raft) campaign() {
@@ -331,6 +475,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.leaderId = -1
 
 	rf.log = []LogEntry{{0, 0, nil}}
 	rf.logIndex = 1
@@ -344,20 +489,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.notifyApplyCh = make(chan struct{}, 100)
 	rf.shutdownCh = make(chan struct{})
+	rf.c = make(chan *ev, 256)
 	rf.electionTimer = time.NewTimer(randDuration(ElectionTimeout))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go func() {
-		for {
-			select {
-			case <-rf.electionTimer.C:
-				rf.campaign()
-			case <-rf.shutdownCh:
-				return
-			}
-		}
-	}()
+	go rf.loop()
 
 	return rf
 }
